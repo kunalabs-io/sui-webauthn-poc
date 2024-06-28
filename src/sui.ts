@@ -1,57 +1,19 @@
-import { BCS, getSuiMoveConfig, fromB64 } from '@mysten/bcs'
+import { BCS, getSuiMoveConfig, fromB64, toHEX } from '@mysten/bcs'
 import { secp256r1 } from '@noble/curves/p256'
 import { sha256 } from '@noble/hashes/sha256'
 
 const bcs = new BCS(getSuiMoveConfig())
 
-// `@mysten/bcs` library doesn't have a generic fixed length sequence type
-// so we need to register the "signature" and "pubkey" types manually
-bcs.registerType(
-  'signature',
-  function encodeSignature(writer, data: Uint8Array) {
-    if (data.length !== 64) {
-      throw new Error(`Signature must be 64 bytes, got ${data.length}`)
-    }
-    for (const byte of data) {
-      writer.write8(byte)
-    }
-    return writer
-  },
-  function decodePubkey(reader) {
-    return reader.readBytes(64)
-  }
-)
-
-bcs.registerType(
-  'pubkey',
-  function encodePubkey(writer, data: Uint8Array) {
-    if (data.length !== 33) {
-      throw new Error(`Signature must be 64 bytes, got ${data.length}`)
-    }
-    for (const byte of data) {
-      writer.write8(byte)
-    }
-    return writer
-  },
-  function decodePubkey(reader) {
-    return reader.readBytes(33)
-  }
-)
-
-bcs.registerStructType('WebAuthnSignature', {
-  flag: BCS.U8,
+bcs.registerStructType('PasskeyAuthenticator', {
   authenticatorData: [BCS.VECTOR, BCS.U8],
-  clientDataJSON: [BCS.VECTOR, BCS.U8],
-  signature: 'signature',
-  pubkey: 'pubkey',
+  clientDataJson: BCS.STRING,
+  userSignature: [BCS.VECTOR, BCS.U8],
 })
 
-export interface WebAuthnSignature {
-  flag: number
+export interface PasskeyAuthenticator {
   authenticatorData: Uint8Array
-  clientDataJSON: Uint8Array
-  signature: Uint8Array
-  pubkey: Uint8Array
+  clientDataJson: string
+  userSignature: Uint8Array
 }
 
 const WEBAUTHN_FLAG = 0x06
@@ -68,34 +30,70 @@ export function encodeWebAuthnSignature(
 ) {
   const authenticatorData = new Uint8Array(response.authenticatorData)
   const clientDataJSON = new Uint8Array(response.clientDataJSON) // response.clientDataJSON is already UTF-8 encoded JSON
-  const signature = secp256r1.Signature.fromDER(
-    new Uint8Array(response.signature)
-  ).toCompactRawBytes()
-  const compressedPubkey = secp256r1.ProjectivePoint.fromHex(pubkey).toRawBytes(true)
+  const decoder = new TextDecoder('utf-8');
+  const clientDataJSONString: string = decoder.decode(clientDataJSON);
 
-  return bcs
-    .ser('WebAuthnSignature', {
-      flag: WEBAUTHN_FLAG,
-      authenticatorData,
-      clientDataJSON,
-      signature,
-      pubkey: compressedPubkey,
+  const sig = secp256r1.Signature.fromDER(
+    new Uint8Array(response.signature)
+  )
+  let before = sig.toCompactRawBytes()
+  let normalized = sig.normalizeS().toCompactRawBytes()
+  console.log(`before (hex): ${toHEX(before)}`)
+  console.log(`after (hex): ${toHEX(normalized)}`)
+  const compressedPubkey = secp256r1.ProjectivePoint.fromHex(pubkey).toRawBytes(true)
+  const concatenatedArray = new Uint8Array(1+normalized.length + compressedPubkey.length);
+  concatenatedArray.set([0x02]); // r1
+  concatenatedArray.set(normalized, 1);
+  concatenatedArray.set(compressedPubkey, 1+ normalized.length);
+
+  let bytes = bcs
+  .ser('PasskeyAuthenticator', {
+    authenticatorData: authenticatorData,
+    clientDataJson: clientDataJSONString,
+    userSignature: concatenatedArray,
+  })
+  .toBytes();
+
+  const zkloginSignatureArray = new Uint8Array(1+bytes.length);
+  zkloginSignatureArray.set([WEBAUTHN_FLAG]);
+  zkloginSignatureArray.set(bytes, 1);
+  return zkloginSignatureArray;
+}
+
+
+export function serializePasskeySignature(
+  authenticatorData: Uint8Array,
+  clientDataJSON: String,
+  signature: Uint8Array,
+  pubkey: Uint8Array
+) {
+  const concatenatedArray = new Uint8Array(1+signature.length + pubkey.length);
+  concatenatedArray.set([0x02]); // r1
+  concatenatedArray.set(signature, 1);
+  concatenatedArray.set(pubkey, 1+ signature.length);
+
+  let bytes = bcs
+    .ser('PasskeyAuthenticator', {
+      authenticatorData: authenticatorData,
+      clientDataJson: clientDataJSON,
+      userSignature: concatenatedArray,
     })
-    .toBytes()
+    .toBytes();
+    const signatureBytes = new Uint8Array(bytes.length + 1);
+    signatureBytes.set([WEBAUTHN_FLAG]);
+    signatureBytes.set(bytes, 1);
+    return signatureBytes;
 }
 
 /**
  * Decode a Sui WebAuthn signature
  */
-export function decodeWebAuthnSignature(signature: Uint8Array): WebAuthnSignature {
-  const dec = bcs.de('WebAuthnSignature', signature)
-
+export function decodeWebAuthnSignature(signature: Uint8Array): PasskeyAuthenticator {
+  const dec = bcs.de('PasskeyAuthenticator', signature.slice(1))
   return {
-    flag: dec.flag,
     authenticatorData: new Uint8Array(dec.authenticatorData),
-    clientDataJSON: new Uint8Array(dec.clientDataJSON),
-    signature: new Uint8Array(dec.signature),
-    pubkey: new Uint8Array(dec.pubkey),
+    clientDataJson: dec.clientDataJson,
+    userSignature: new Uint8Array(dec.userSignature),
   }
 }
 
@@ -140,15 +138,16 @@ export function bytesEqual(a: Uint8Array, b: Uint8Array) {
  */
 export function verifyEncodedSignature(challenge: Uint8Array, signature: Uint8Array): boolean {
   const decoded = decodeWebAuthnSignature(signature)
-
-  const clientDataJSON = JSON.parse(new TextDecoder().decode(decoded.clientDataJSON))
+  const clientDataJSON = JSON.parse(decoded.clientDataJson)
   const parsedChallenge = fromB64Url(clientDataJSON.challenge)
   if (!bytesEqual(challenge, parsedChallenge)) {
     return false
   }
 
-  const message = new Uint8Array([...decoded.authenticatorData, ...sha256(decoded.clientDataJSON)])
-
+  const message = new Uint8Array([...decoded.authenticatorData, ...sha256(decoded.clientDataJson)])
+  console.log('sig', decoded.userSignature);
+  let sig = decoded.userSignature.slice(1, 64 + 1);
+  let pk = decoded.userSignature.slice(1 + 64);
   // ES256 (ECDSA w/ SHA-256)
-  return secp256r1.verify(decoded.signature, sha256(message), decoded.pubkey)
+  return secp256r1.verify(sig, sha256(message), pk)
 }

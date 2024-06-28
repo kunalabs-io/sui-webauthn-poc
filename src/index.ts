@@ -6,6 +6,12 @@ import { secp256r1 } from '@noble/curves/p256'
 import { findPossiblePublicKeys, messageFromAssertionResponse } from './crypto'
 import { decodeWebAuthnSignature, encodeWebAuthnSignature, verifyEncodedSignature } from './sui'
 import { parseDerSPKI } from './util'
+import { blake2b } from '@noble/hashes/blake2b';
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import { getFullnodeUrl, SuiClient } from '@mysten/sui.js/client';
+import { getFaucetHost, requestSuiFromFaucetV0 } from '@mysten/sui.js/faucet';
+import { bytesToHex } from '@noble/hashes/utils'
+import { SUI_ADDRESS_LENGTH, normalizeSuiAddress } from '@mysten/sui.js/utils'
 
 function clearOutput() {
   document.getElementById('output')!.innerText = ''
@@ -30,6 +36,9 @@ class Store {
   #pubkey?: Uint8Array
   credentialId?: Uint8Array
   supportsLargeBlob?: boolean
+  address?: string
+  txBytes?: Uint8Array
+  client = new SuiClient({ url: getFullnodeUrl('localnet') });
 
   ecdsaRecovery: {
     credentialId?: Uint8Array
@@ -56,6 +65,7 @@ addEventListener('load', () => {
 
   // Register click handlers
   onClick('create', () => createHandler())
+  onClick('fund-and-create-tx', () => createTxHandler())
   onClick('sign', () => signHandler())
   onClick('recover-ecdsa', () => recoverEcdsa())
   onClick('recover-largeBlob', () => recoverLargeBlobHandler())
@@ -74,13 +84,12 @@ async function createHandler() {
       .map(() => String.fromCharCode(Math.random() * 26 + 65))
       .join('')
   }
-
   const credential = (await navigator.credentials.create({
     publicKey: {
       // The challenge is not important here. It would normally be used to verify the attestation.
       challenge: new TextEncoder().encode("Don't trust, verify!"),
       rp: {
-        name: 'Sui WebAuthn POC',
+        name: 'Sui WebAuthn POC'
       },
       user: {
         id: Uint8Array.from(randomString(10), c => c.charCodeAt(0)),
@@ -91,7 +100,7 @@ async function createHandler() {
       authenticatorSelection: {
         authenticatorAttachment: 'cross-platform',
         residentKey: 'required',
-        requireResidentKey: true,
+        requireResidentKey: true, // this may already be default
         userVerification: 'required',
       },
       timeout: 60000,
@@ -110,25 +119,30 @@ async function createHandler() {
   const pubkey = secp256r1.ProjectivePoint.fromHex(pubkeyUncompressed)
 
   const pubkeyCompressed = pubkey.toRawBytes(true)
-  console.log('pubkeyUncompressed', pubkeyUncompressed)
-  console.log('pubkeyCompressed', pubkeyCompressed)
-
   const credentialId = new Uint8Array(credential.rawId)
-  console.log('credential ID', credentialId)
 
   const supportsLargeBlob =
     (credential.getClientExtensionResults() as any).largeBlob.supported === true
+  let pk_bytes = pubkey.toRawBytes(true);
+  let extended = new Uint8Array(34);
+  extended.set([6]);
+  extended.set(pk_bytes, 1);
+  let address = normalizeSuiAddress(
+    bytesToHex(blake2b(extended, { dkLen: 32 })).slice(0, SUI_ADDRESS_LENGTH * 2),
+  );
 
-  log([
+    log([
     'Passkey created!',
-    `pubkey (hex): ${toHEX(pubkey.toRawBytes(true))}`,
+    `pubkey (hex): ${toHEX(pubkeyCompressed)}`,
     `credential ID (base64): ${toB64(credentialId)}`,
+    `sui address: ${address}`,
     `supports largeBlob: ${supportsLargeBlob}`,
   ])
 
   store.pubkey = pubkey.toRawBytes(true)
   store.credentialId = credentialId
   store.supportsLargeBlob = supportsLargeBlob
+  store.address = address
 
   /*
   Alternate way of decoding the pubkey (through parsing attestationObject):
@@ -152,54 +166,85 @@ async function createHandler() {
   */
 }
 
+async function createTxHandler() {
+  let address = store.address!;
+	const tx = new TransactionBlock();
+
+  await requestSuiFromFaucetV0({
+    host: getFaucetHost('localnet'),
+    recipient: address,
+  });
+  let coins = await store.client.getCoins({
+    owner: address,
+    coinType: "0x2::sui::SUI",
+  });
+  const coin = coins.data[3];
+
+	tx.setSender(address);
+	tx.setGasPrice(1000);
+	tx.setGasBudget(2000000);
+  tx.setGasPayment([
+    {
+      objectId: coin.coinObjectId,
+      version: coin.version,
+      digest: coin.digest,
+    },
+  ]);
+  let bytes = await tx.build();
+  store.txBytes = bytes;
+  log([
+    'Address funded and prepared a test txn!',
+    `sui address: ${address}`,
+    `tx: ${toB64(bytes)}`,
+  ])
+}
+
 async function signHandler() {
   clearOutput()
 
-  /* generate a random tx digest */
-  const randomTxDigest = new Uint8Array(32)
-  for (let i = 0; i < 32; i++) {
-    randomTxDigest[i] = Math.floor(Math.random() * 256)
-  }
-
-  /* optionally, we can specify the credentialId to use */
-  let allowCredentials: undefined | PublicKeyCredentialDescriptor[] = undefined
-  if (store.credentialId) {
-    allowCredentials = [
-      {
-        id: store.credentialId,
-        type: 'public-key',
-      },
-    ]
-  }
+  const digest = blake2b(store.txBytes!, { dkLen: 32 });
+  let extended = new Uint8Array(35);
+  extended.set([0, 0, 0]);
+  extended.set(digest, 3);
 
   const credential = (await navigator.credentials.get({
     publicKey: {
-      challenge: randomTxDigest,
-      allowCredentials, // optional
-      userVerification: 'required',
+      challenge: extended,
+      // allowCredentials, // optional
+      userVerification: 'discouraged',
     },
   })) as AuthenticationCredential
 
   const encoded = encodeWebAuthnSignature(store.pubkey!, credential.response)
   const decoded = decodeWebAuthnSignature(encoded)
 
-  console.log('encoded signature', encoded)
-  console.log('decoded signature', decoded)
-
-  const result = verifyEncodedSignature(randomTxDigest, encoded)
+  const result = verifyEncodedSignature(extended, encoded)
+  console.log('result', result)
+  const onchainResult = await store.client.executeTransactionBlock({
+	transactionBlock: toB64(store.txBytes!),
+	signature: toB64(encoded),
+	options: {
+		showEffects: true,
+	},
+});
 
   log([
     `credential id (base64): ${toB64(new Uint8Array(credential.rawId))}`,
     `pubkey (hex): ${toHEX(store.pubkey!)}`,
-    `tx digest (hex): ${toHEX(randomTxDigest)}`,
+    `sui address: ${store.address}`,
+    `tx bytes: ${toB64(store.txBytes!)}`,
+    `tx digest (hex): ${toHEX(extended)}`,
     `authenticatorData (hex): ${toHEX(decoded.authenticatorData)}`,
-    `clientDataJSON: \`${new TextDecoder().decode(decoded.clientDataJSON)}\``,
-    `signature (hex): ${toHEX(decoded.signature)}`,
-    `encoded webauthn signature (base64): ${toB64(encoded)}`,
+    `clientDataJSON: \`${decoded.clientDataJson}\``,
+    `r1 signature (hex): ${toHEX(decoded.userSignature)}`,
+    `encoded sui signature (base64): ${toB64(encoded)}`,
     `encoded webuahthn signature length: ${encoded.length}`,
     `signature verified: ${result}`,
+    `localnet onchain verified, digest: ${onchainResult.digest}`,
+    `localnet onchain verified, sig: ${onchainResult.transaction?.txSignatures}`,
   ])
 }
+
 
 async function recoverEcdsa() {
   clearOutput()

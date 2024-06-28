@@ -8,7 +8,7 @@ This is POC accompanying the WebAuthn SIP. It's a simple web app that demonstrat
 
 Steps to run:
 - `pnpm install`
-- `pnpm run`
+- `pnpm dev`
 - visit `http://localhost:5173`
 
 
